@@ -3,7 +3,6 @@ import {
   createScan,
   downloadScanReportPdf,
   getScan,
-  getScanReport,
   getScanResults,
   getScans,
   getScanStatus,
@@ -348,6 +347,26 @@ function buildEmptyReport() {
       { label: 'Executive summary', detail: 'Available after the first completed scan.' },
       { label: 'Technical appendix', detail: 'Available after the first completed scan.' },
       { label: 'JSON export', detail: 'Available after the first completed scan.' },
+    ],
+  }
+}
+
+function buildLiveReport(scan = {}, results = {}) {
+  const findingsCount = Array.isArray(results.findings) ? results.findings.length : 0
+  const targetUrl = scan.targetUrl ?? results.targetUrl ?? 'Unknown target'
+  const scanType = scan.scanType ?? results.scanType ?? 'Unknown'
+
+  return {
+    id: String(scan.id ?? results.id ?? ''),
+    generatedAt: scan.createdAt ?? new Date().toISOString(),
+    format: 'PDF + JSON',
+    size: findingsCount ? `${findingsCount} findings` : 'No findings',
+    scope: targetUrl,
+    summary: `Report for ${targetUrl} (${scanType}). Use Download PDF for the generated document or Export JSON for the structured payload.`,
+    artifacts: [
+      { label: 'Executive summary', detail: `Risk score: ${results.summary?.riskScore ?? 0}/100.` },
+      { label: 'Technical appendix', detail: `${findingsCount} findings included in the result set.` },
+      { label: 'JSON export', detail: 'Generated directly from the active frontend state.' },
     ],
   }
 }
@@ -722,25 +741,13 @@ function App() {
   )
 
   const loadReport = useCallback(
-    async (scanId, silent = true) => {
-      try {
-        const payload = await getScanReport(scanId)
-
-        if (payload instanceof Blob) {
-          return null
-        }
-
-        const normalized = normalizeReport(payload, currentScan)
-        setReportData(normalized)
-        return normalized
-      } catch (error) {
-        if (!silent) {
-          pushToast('Unable to load report', error.message)
-        }
-        return null
-      }
+    async (scanId) => {
+      const activeScan = currentScan?.id === scanId ? currentScan : scans.find((scan) => scan.id === scanId)
+      const normalized = buildLiveReport(activeScan, resultsData)
+      setReportData(normalized)
+      return normalized
     },
-    [currentScan, pushToast],
+    [currentScan, resultsData, scans],
   )
 
   const loadStatus = useCallback(
