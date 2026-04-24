@@ -1,6 +1,9 @@
 package org.example.redoor;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.verify;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
@@ -72,6 +75,12 @@ class RedoorApplicationTests {
     void createScanStoresQueuedJob() throws Exception {
         String token = login("user", "user123");
 
+        doAnswer(invocation -> {
+            java.util.UUID scanId = invocation.getArgument(0);
+            assertThat(scanJobRepository.existsById(scanId)).isTrue();
+            return null;
+        }).when(scannerEngineService).executeScan(any(java.util.UUID.class));
+
         MvcResult result = mockMvc.perform(post("/api/scans")
                         .header("Authorization", "Bearer " + token)
                         .contentType(MediaType.APPLICATION_JSON)
@@ -88,7 +97,9 @@ class RedoorApplicationTests {
                 .andReturn();
 
         JsonNode body = objectMapper.readTree(result.getResponse().getContentAsString());
-        assertThat(scanJobRepository.existsById(java.util.UUID.fromString(body.get("id").asText()))).isTrue();
+        java.util.UUID scanId = java.util.UUID.fromString(body.get("id").asText());
+        assertThat(scanJobRepository.existsById(scanId)).isTrue();
+        verify(scannerEngineService).executeScan(scanId);
     }
 
     private String login(String username, String password) throws Exception {

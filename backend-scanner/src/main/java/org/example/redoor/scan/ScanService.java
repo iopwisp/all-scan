@@ -8,6 +8,8 @@ import org.example.redoor.common.ApiException;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 @Service
 public class ScanService {
@@ -44,7 +46,19 @@ public class ScanService {
         scanJob.setCreatedAt(Instant.now());
 
         ScanJob savedScanJob = scanJobRepository.saveAndFlush(scanJob);
-        scannerEngineService.executeScan(savedScanJob.getId());
+        UUID scanId = savedScanJob.getId();
+
+        if (TransactionSynchronizationManager.isSynchronizationActive()) {
+            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                @Override
+                public void afterCommit() {
+                    scannerEngineService.executeScan(scanId);
+                }
+            });
+        } else {
+            scannerEngineService.executeScan(scanId);
+        }
+
         return ScanResponseMapper.toCreatedResponse(savedScanJob);
     }
 

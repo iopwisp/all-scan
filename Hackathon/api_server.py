@@ -17,6 +17,9 @@ PORT = int(os.getenv("ALLSCAN_API_PORT", "8000"))
 ALLOWED_ORIGIN = os.getenv("ALLSCAN_ALLOWED_ORIGIN", "*")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 REPORTS_DIR = os.path.join(BASE_DIR, "data", "reports")
+LEGACY_REPORT_PATH = os.path.join(BASE_DIR, "report.json")
+SCAN_STATE_SUFFIX = ".scan.json"
+RAW_REPORT_SUFFIX = ".report.json"
 
 os.makedirs(REPORTS_DIR, exist_ok=True)
 
@@ -122,7 +125,11 @@ def resolve_depth(scan_type):
 
 
 def scan_report_path(scan_id):
-    return os.path.join(REPORTS_DIR, f"{scan_id}.json")
+    return os.path.join(REPORTS_DIR, f"{scan_id}{RAW_REPORT_SUFFIX}")
+
+
+def scan_state_path(scan_id):
+    return os.path.join(REPORTS_DIR, f"{scan_id}{SCAN_STATE_SUFFIX}")
 
 
 def summarize_findings(findings):
@@ -195,6 +202,163 @@ def build_manual_targets(target_url):
     ]
 
 
+def persist_json(path, payload):
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
+
+
+def persist_scan_record(record):
+    persist_json(scan_state_path(record["id"]), record)
+
+
+def register_scan_record(record):
+    scan_id = record["id"]
+    scan_store[scan_id] = record
+    if scan_id not in scan_order:
+        scan_order.append(scan_id)
+
+
+def sort_scan_order():
+    scan_order.sort(
+        key=lambda scan_id: scan_store[scan_id].get("createdAt", ""),
+        reverse=True,
+    )
+
+
+def build_record_from_raw_report(scan_id, raw_report, created_at, source_label):
+    findings = [format_finding(item) for item in raw_report.get("findings", [])]
+    summary = summarize_findings(findings)
+    scan_status = str(raw_report.get("scan_status", "completed")).lower()
+    is_completed = scan_status == "completed"
+    stage = PROGRESS_STAGES[-1] if is_completed else PROGRESS_STAGES[-2]
+    progress = 100 if is_completed else 85
+    target_url = raw_report.get("target_url", "Unknown target")
+    scan_type = resolve_scan_type(raw_report.get("scan_type", "deep"))
+    report_generated_at = created_at
+
+    results = {
+        "id": scan_id,
+        "targetUrl": target_url,
+        "scanType": scan_type,
+        "status": "completed" if is_completed else "running",
+        "progress": progress,
+        "stage": stage,
+        "createdAt": created_at,
+        "summary": summary,
+        "findings": findings,
+        "owaspMappings": build_owasp_mappings(findings),
+    }
+
+    report = {
+        "id": scan_id,
+        "generatedAt": report_generated_at,
+        "format": "PDF + JSON",
+        "size": f"{len(findings)} finding(s)",
+        "scope": target_url,
+        "summary": f"Imported from {source_label}.",
+        "artifacts": [
+            {"label": "Executive summary", "detail": "Imported persisted scan summary."},
+            {"label": "Technical appendix", "detail": "Imported findings and remediation details."},
+            {"label": "JSON export", "detail": source_label},
+        ],
+    }
+
+    return {
+        "id": scan_id,
+        "targetUrl": target_url,
+        "scanType": scan_type,
+        "requestedChecks": [],
+        "unsupportedChecks": [],
+        "status": "completed" if is_completed else "running",
+        "progress": progress,
+        "stage": stage,
+        "createdAt": created_at,
+        "logs": [
+            {
+                "time": display_time(),
+                "level": "info",
+                "message": f"Loaded persisted report from {source_label}.",
+            }
+        ],
+        "results": results,
+        "report": report,
+    }
+
+
+def load_scan_state_files():
+    if not os.path.isdir(REPORTS_DIR):
+        return
+
+    for name in os.listdir(REPORTS_DIR):
+        if not name.endswith(SCAN_STATE_SUFFIX):
+            continue
+
+        path = os.path.join(REPORTS_DIR, name)
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            continue
+
+        if not isinstance(payload, dict) or not payload.get("id"):
+            continue
+
+        register_scan_record(payload)
+
+
+def load_raw_report_files():
+    if not os.path.isdir(REPORTS_DIR):
+        return
+
+    for name in os.listdir(REPORTS_DIR):
+        if not name.endswith(RAW_REPORT_SUFFIX):
+            continue
+
+        scan_id = name[: -len(RAW_REPORT_SUFFIX)]
+        if scan_id in scan_store:
+            continue
+
+        path = os.path.join(REPORTS_DIR, name)
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            continue
+
+        created_at = datetime.fromtimestamp(os.path.getmtime(path), timezone.utc).isoformat().replace("+00:00", "Z")
+        record = build_record_from_raw_report(scan_id, payload, created_at, name)
+        register_scan_record(record)
+        persist_scan_record(record)
+
+
+def import_legacy_report():
+    if scan_order or not os.path.exists(LEGACY_REPORT_PATH):
+        return
+
+    try:
+        with open(LEGACY_REPORT_PATH, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return
+
+    created_at = datetime.fromtimestamp(os.path.getmtime(LEGACY_REPORT_PATH), timezone.utc).isoformat().replace(
+        "+00:00", "Z"
+    )
+    scan_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"legacy:{LEGACY_REPORT_PATH}"))
+    record = build_record_from_raw_report(scan_id, payload, created_at, "report.json")
+    register_scan_record(record)
+    persist_scan_record(record)
+    persist_json(scan_report_path(scan_id), payload)
+
+
+def load_persisted_scans():
+    with store_lock:
+        load_scan_state_files()
+        load_raw_report_files()
+        import_legacy_report()
+        sort_scan_order()
+
+
 def create_scan_record(target_url, scan_type, checks, unsupported_checks):
     scan_id = str(uuid.uuid4())
     record = {
@@ -228,8 +392,9 @@ def create_scan_record(target_url, scan_type, checks, unsupported_checks):
         )
 
     with store_lock:
-        scan_store[scan_id] = record
-        scan_order.insert(0, scan_id)
+        register_scan_record(record)
+        sort_scan_order()
+        persist_scan_record(record)
 
     return record
 
@@ -250,12 +415,14 @@ def append_log(scan_id, level, message):
                 "message": message,
             },
         ][-12:]
+        persist_scan_record(record)
 
 
 def update_scan(scan_id, **changes):
     with store_lock:
         record = scan_store[scan_id]
         record.update(changes)
+        persist_scan_record(record)
         return dict(record)
 
 
@@ -419,6 +586,7 @@ def run_scan(scan_id, target_url, scan_type, selected_checks):
         append_log(scan_id, "info", "Active checks started.")
         update_scan(scan_id, progress=75, stage=PROGRESS_STAGES[3])
         raw_report = orchestrator.run(all_targets)
+        persist_json(report_path, raw_report)
 
         findings = [format_finding(item) for item in raw_report.get("findings", [])]
         summary = summarize_findings(findings)
@@ -622,6 +790,7 @@ class AllScanApiHandler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    load_persisted_scans()
     server = ThreadingHTTPServer((HOST, PORT), AllScanApiHandler)
     print(f"[*] AllScan API listening on http://{HOST}:{PORT}")
     server.serve_forever()

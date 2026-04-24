@@ -24,7 +24,6 @@ import org.jsoup.nodes.Element;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
 
 @Service
 public class ScannerEngineService {
@@ -81,7 +80,6 @@ public class ScannerEngineService {
     }
 
     @Async("scannerTaskExecutor")
-    @Transactional
     public void executeScan(UUID scanId) {
         ScanJob scanJob = scanJobRepository.findById(scanId).orElseThrow();
         try {
@@ -97,6 +95,7 @@ public class ScannerEngineService {
     private void runScan(ScanJob scanJob) throws IOException, InterruptedException {
         List<CheckType> checks = scanJob.requestedChecksAsList();
         Set<String> seenFindings = new LinkedHashSet<>();
+        int riskScore = 0;
 
         updateState(scanJob, ScanStatus.RUNNING, 5, "Crawling target");
         FetchResponse baseResponse = fetchGet(scanJob.getTargetUrl());
@@ -111,28 +110,28 @@ public class ScannerEngineService {
             switch (check) {
                 case XSS -> {
                     updateState(scanJob, ScanStatus.RUNNING, progress, "Testing reflected XSS");
-                    runXssCheck(scanJob, crawlResult.forms(), crawlResult.getEndpoints(), seenFindings);
+                    riskScore += runXssCheck(scanJob, crawlResult.forms(), crawlResult.getEndpoints(), seenFindings);
                 }
                 case SQLI -> {
                     updateState(scanJob, ScanStatus.RUNNING, progress, "Testing SQL injection");
-                    runSqliCheck(scanJob, crawlResult.forms(), crawlResult.getEndpoints(), seenFindings);
+                    riskScore += runSqliCheck(scanJob, crawlResult.forms(), crawlResult.getEndpoints(), seenFindings);
                 }
                 case CSRF -> {
                     updateState(scanJob, ScanStatus.RUNNING, progress, "Testing forms");
-                    runCsrfCheck(scanJob, crawlResult.forms(), baseResponse, seenFindings);
+                    riskScore += runCsrfCheck(scanJob, crawlResult.forms(), baseResponse, seenFindings);
                 }
                 case OPEN_DIRECTORIES -> {
                     updateState(scanJob, ScanStatus.RUNNING, progress, "Checking open directories");
-                    runOpenDirectoriesCheck(scanJob, seenFindings);
+                    riskScore += runOpenDirectoriesCheck(scanJob, seenFindings);
                 }
                 case LEAKAGE -> {
                     updateState(scanJob, ScanStatus.RUNNING, progress, "Checking exposed files");
-                    runLeakageCheck(scanJob, seenFindings);
+                    riskScore += runLeakageCheck(scanJob, seenFindings);
                 }
             }
         }
 
-        scanJob.setRiskScore(calculateRiskScore(scanJob.getFindings()));
+        scanJob.setRiskScore(calculateRiskScore(riskScore));
         updateState(scanJob, ScanStatus.COMPLETED, 100, "Scan completed");
     }
 
@@ -255,9 +254,10 @@ public class ScannerEngineService {
 
     // ── XSS Check ────────────────────────────────────────────────────────────
 
-    private void runXssCheck(ScanJob scanJob, List<FormDescriptor> forms,
+    private int runXssCheck(ScanJob scanJob, List<FormDescriptor> forms,
             List<GetEndpoint> getEndpoints, Set<String> seenFindings)
             throws IOException, InterruptedException {
+        int riskScore = 0;
 
         // Test all crawled GET endpoints with URL params
         for (GetEndpoint endpoint : getEndpoints) {
@@ -265,7 +265,7 @@ public class ScannerEngineService {
                 for (String payload : XSS_PAYLOADS) {
                     FetchResponse response = fetchGet(buildUrlWithParams(endpoint.url(), Map.of(param, payload)));
                     if (response.body().contains(payload)) {
-                        saveFinding(scanJob, seenFindings, "XSS", Severity.HIGH,
+                        riskScore += saveFinding(scanJob, seenFindings, "XSS", Severity.HIGH,
                                 endpoint.url(), param,
                                 "Reflected XSS payload was returned in the response body.",
                                 "Escape user-controlled content and add output encoding on reflected values.",
@@ -281,7 +281,7 @@ public class ScannerEngineService {
             for (String payload : XSS_PAYLOADS) {
                 FetchResponse response = fetchGet(buildUrlWithParams(scanJob.getTargetUrl(), Map.of("q", payload)));
                 if (response.body().contains(payload)) {
-                    saveFinding(scanJob, seenFindings, "XSS", Severity.HIGH,
+                    riskScore += saveFinding(scanJob, seenFindings, "XSS", Severity.HIGH,
                             scanJob.getTargetUrl(), "q",
                             "Reflected XSS payload was returned in the response body.",
                             "Escape user-controlled content and add output encoding on reflected values.",
@@ -289,7 +289,7 @@ public class ScannerEngineService {
                     break;
                 }
             }
-            return;
+            return riskScore;
         }
 
         for (FormDescriptor form : forms) {
@@ -299,7 +299,7 @@ public class ScannerEngineService {
                 parameters.put(parameter, payload);
                 FetchResponse response = submitForm(form, parameters);
                 if (response.body().contains(payload)) {
-                    saveFinding(scanJob, seenFindings, "XSS", Severity.HIGH,
+                    riskScore += saveFinding(scanJob, seenFindings, "XSS", Severity.HIGH,
                             form.actionUrl(), parameter,
                             "Reflected XSS payload was returned after form submission.",
                             "Sanitize and encode form inputs before rendering them back to the browser.",
@@ -308,13 +308,15 @@ public class ScannerEngineService {
                 }
             }
         }
+        return riskScore;
     }
 
     // ── SQLi Check ───────────────────────────────────────────────────────────
 
-    private void runSqliCheck(ScanJob scanJob, List<FormDescriptor> forms,
+    private int runSqliCheck(ScanJob scanJob, List<FormDescriptor> forms,
             List<GetEndpoint> getEndpoints, Set<String> seenFindings)
             throws IOException, InterruptedException {
+        int riskScore = 0;
 
         // Test all crawled GET endpoints
         for (GetEndpoint endpoint : getEndpoints) {
@@ -322,7 +324,7 @@ public class ScannerEngineService {
                 for (String payload : SQLI_PAYLOADS) {
                     FetchResponse response = fetchGet(buildUrlWithParams(endpoint.url(), Map.of(param, payload)));
                     if (isAbnormalSqlResponse(response)) {
-                        saveFinding(scanJob, seenFindings, "SQLI", Severity.CRITICAL,
+                        riskScore += saveFinding(scanJob, seenFindings, "SQLI", Severity.CRITICAL,
                                 endpoint.url(), param,
                                 "The application produced a database-related abnormal response for a SQL injection payload.",
                                 "Use parameterized queries and avoid building SQL strings from raw request parameters.",
@@ -338,7 +340,7 @@ public class ScannerEngineService {
             for (String payload : SQLI_PAYLOADS) {
                 FetchResponse response = fetchGet(buildUrlWithParams(scanJob.getTargetUrl(), Map.of("id", payload)));
                 if (isAbnormalSqlResponse(response)) {
-                    saveFinding(scanJob, seenFindings, "SQLI", Severity.CRITICAL,
+                    riskScore += saveFinding(scanJob, seenFindings, "SQLI", Severity.CRITICAL,
                             scanJob.getTargetUrl(), "id",
                             "The application produced a database-like abnormal response for a SQL injection payload.",
                             "Use parameterized queries and avoid building SQL strings from raw request parameters.",
@@ -346,7 +348,7 @@ public class ScannerEngineService {
                     break;
                 }
             }
-            return;
+            return riskScore;
         }
 
         for (FormDescriptor form : forms) {
@@ -368,7 +370,7 @@ public class ScannerEngineService {
                 }
 
                 if (found) {
-                    saveFinding(scanJob, seenFindings, "SQLI", Severity.CRITICAL,
+                    riskScore += saveFinding(scanJob, seenFindings, "SQLI", Severity.CRITICAL,
                             form.actionUrl(), parameter,
                             "The application produced an abnormal database-related response for a SQL injection payload.",
                             "Use prepared statements, typed validation, and strict server-side query parameter handling.",
@@ -377,16 +379,18 @@ public class ScannerEngineService {
                 }
             }
         }
+        return riskScore;
     }
 
     // ── CSRF Check ───────────────────────────────────────────────────────────
 
-    private void runCsrfCheck(
+    private int runCsrfCheck(
             ScanJob scanJob,
             List<FormDescriptor> forms,
             FetchResponse baseResponse,
             Set<String> seenFindings
     ) {
+        int riskScore = 0;
         boolean hasSameSiteCookie = baseResponse.headerValues("set-cookie")
                 .stream()
                 .anyMatch(value -> value.toLowerCase(Locale.ROOT).contains("samesite"));
@@ -395,48 +399,53 @@ public class ScannerEngineService {
             if ("GET".equals(form.method())) continue;
             boolean hasCsrfToken = form.hiddenInputs().keySet().stream().anyMatch(this::looksLikeCsrfToken);
             if (!hasCsrfToken || !hasSameSiteCookie) {
-                saveFinding(scanJob, seenFindings, "CSRF", Severity.MEDIUM, form.actionUrl(), null,
+                riskScore += saveFinding(scanJob, seenFindings, "CSRF", Severity.MEDIUM, form.actionUrl(), null,
                         buildCsrfDescription(hasCsrfToken, hasSameSiteCookie),
                         "Add an anti-CSRF token to state-changing forms and ensure session cookies use SameSite protection.",
                         "A01:2021 - Broken Access Control", null, AI_REMEDIATION_MAP.get("CSRF"));
             }
         }
+        return riskScore;
     }
 
     // ── Directory + Leakage Checks ───────────────────────────────────────────
 
-    private void runOpenDirectoriesCheck(ScanJob scanJob, Set<String> seenFindings)
+    private int runOpenDirectoriesCheck(ScanJob scanJob, Set<String> seenFindings)
             throws IOException, InterruptedException {
+        int riskScore = 0;
         for (String path : DIRECTORY_PATHS) {
             String target = resolvePath(scanJob.getTargetUrl(), path);
             FetchResponse response = fetchGet(target);
             if (looksLikeOpenDirectory(response)) {
-                saveFinding(scanJob, seenFindings, "OPEN_DIRECTORIES", Severity.MEDIUM, target, null,
+                riskScore += saveFinding(scanJob, seenFindings, "OPEN_DIRECTORIES", Severity.MEDIUM, target, null,
                         "A potentially exposed directory is reachable and appears to list or expose content.",
                         "Disable directory listing and restrict public access to administrative and backup folders.",
                         "A05:2021 - Security Misconfiguration", path, AI_REMEDIATION_MAP.get("OPEN_DIRECTORIES"));
             }
         }
+        return riskScore;
     }
 
-    private void runLeakageCheck(ScanJob scanJob, Set<String> seenFindings)
+    private int runLeakageCheck(ScanJob scanJob, Set<String> seenFindings)
             throws IOException, InterruptedException {
+        int riskScore = 0;
         for (String path : LEAKAGE_PATHS) {
             String target = resolvePath(scanJob.getTargetUrl(), path);
             FetchResponse response = fetchGet(target);
             if (looksSensitive(path, response)) {
                 Severity severity = "/phpinfo.php".equals(path) ? Severity.MEDIUM : Severity.HIGH;
-                saveFinding(scanJob, seenFindings, "LEAKAGE", severity, target, null,
+                riskScore += saveFinding(scanJob, seenFindings, "LEAKAGE", severity, target, null,
                         "Sensitive file exposure was detected on a well-known path.",
                         "Remove exposed files from the web root and block direct access to configuration and backup assets.",
                         "A05:2021 - Security Misconfiguration", path, AI_REMEDIATION_MAP.get("LEAKAGE"));
             }
         }
+        return riskScore;
     }
 
     // ── Persistence ──────────────────────────────────────────────────────────
 
-    private void saveFinding(
+    private int saveFinding(
             ScanJob scanJob,
             Set<String> seenFindings,
             String type,
@@ -450,7 +459,7 @@ public class ScannerEngineService {
             String aiRemediation
     ) {
         String fingerprint = type + "|" + url + "|" + (parameter == null ? "" : parameter);
-        if (!seenFindings.add(fingerprint)) return;
+        if (!seenFindings.add(fingerprint)) return 0;
 
         Finding finding = new Finding();
         finding.setScanJob(scanJob);
@@ -464,7 +473,7 @@ public class ScannerEngineService {
         finding.setPayload(payload);
         finding.setAiRemediation(aiRemediation != null ? aiRemediation : recommendation);
         findingRepository.save(finding);
-        scanJob.getFindings().add(finding);
+        return severity.getScoreWeight();
     }
 
     private void updateState(ScanJob scanJob, ScanStatus status, int progress, String stage) {
@@ -480,8 +489,8 @@ public class ScannerEngineService {
         scanJobRepository.save(scanJob);
     }
 
-    private int calculateRiskScore(List<Finding> findings) {
-        return Math.min(100, findings.stream().map(Finding::getSeverity).mapToInt(Severity::getScoreWeight).sum());
+    private int calculateRiskScore(int scoreWeightSum) {
+        return Math.min(100, scoreWeightSum);
     }
 
     // ── HTTP helpers ─────────────────────────────────────────────────────────

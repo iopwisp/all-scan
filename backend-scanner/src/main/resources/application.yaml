@@ -17,6 +17,11 @@ spring:
     console:
       enabled: true
       path: /h2-console
+  jackson:
+    deserialization:
+      read-unknown-enum-values-as-null: true
+    mapper:
+      accept-case-insensitive-enums: true
 
 server:
   port: 8080

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   createScan,
   downloadScanReportPdf,
@@ -30,6 +30,20 @@ const severityStyles = {
   High: 'border-orange-400/30 bg-orange-500/10 text-orange-100',
   Medium: 'border-amber-300/30 bg-amber-400/10 text-amber-100',
   Low: 'border-cyan-300/30 bg-cyan-400/10 text-cyan-100',
+}
+
+const scanTypeApiMap = {
+  fast: 'QUICK',
+  deep: 'FULL',
+  'owasp-full': 'FULL',
+}
+
+const checkTypeApiMap = {
+  xss: 'XSS',
+  sqli: 'SQLI',
+  csrf: 'CSRF',
+  directoryScan: 'OPEN_DIRECTORIES',
+  configLeak: 'LEAKAGE',
 }
 
 function getPageFromHash() {
@@ -280,6 +294,64 @@ function buildDemoReport(scanId, targetUrl, scanType) {
   }
 }
 
+function buildEmptyStatus() {
+  return {
+    id: '',
+    state: 'idle',
+    percent: 0,
+    currentStage: 'Waiting for first scan',
+    stages: progressStages,
+    logs: [
+      {
+        time: formatTimeLabel(Date.now()),
+        level: 'info',
+        message: 'Live API connected. Start a scan to see progress here.',
+      },
+    ],
+  }
+}
+
+function buildEmptyResults() {
+  return {
+    id: '',
+    targetUrl: 'No scans yet',
+    scanType: '—',
+    summary: {
+      riskScore: 0,
+      critical: 0,
+      high: 0,
+      medium: 0,
+      low: 0,
+    },
+    findings: [],
+    owaspMappings: [],
+    severityChart: severityOrder.map((label) => ({
+      label,
+      value: 0,
+    })),
+    trend: demoResults.trend.map((point) => ({
+      ...point,
+      value: 0,
+    })),
+  }
+}
+
+function buildEmptyReport() {
+  return {
+    id: '',
+    generatedAt: new Date().toISOString(),
+    format: 'Pending',
+    size: 'Pending',
+    scope: 'No active scan',
+    summary: 'Start a scan to generate a report.',
+    artifacts: [
+      { label: 'Executive summary', detail: 'Available after the first completed scan.' },
+      { label: 'Technical appendix', detail: 'Available after the first completed scan.' },
+      { label: 'JSON export', detail: 'Available after the first completed scan.' },
+    ],
+  }
+}
+
 function downloadBlob(blob, filename) {
   const url = URL.createObjectURL(blob)
   const anchor = document.createElement('a')
@@ -455,6 +527,7 @@ function ToastViewport({ toasts, onDismiss }) {
 }
 
 function App() {
+  const hasLoadedScansRef = useRef(false)
   const [page, setPage] = useState(getPageFromHash())
   const [dataSource, setDataSource] = useState('demo')
   const [loadingScans, setLoadingScans] = useState(true)
@@ -476,14 +549,21 @@ function App() {
   })
 
   const pushToast = useCallback((title, description) => {
-    setToasts((current) => [
-      ...current,
-      {
-        id: `${Date.now()}-${Math.random()}`,
-        title,
-        description,
-      },
-    ])
+    setToasts((current) => {
+      const lastToast = current[current.length - 1]
+      if (lastToast?.title === title && lastToast?.description === description) {
+        return current
+      }
+
+      return [
+        ...current,
+        {
+          id: `${Date.now()}-${Math.random()}`,
+          title,
+          description,
+        },
+      ]
+    })
   }, [])
 
   const removeToast = useCallback((id) => {
@@ -521,6 +601,14 @@ function App() {
       vulnerabilityChecks
         .filter((item) => formState.checks[item.id])
         .map((item) => item.label),
+    [formState.checks],
+  )
+
+  const selectedCheckIds = useMemo(
+    () =>
+      vulnerabilityChecks
+        .filter((item) => formState.checks[item.id])
+        .map((item) => item.id),
     [formState.checks],
   )
 
@@ -567,7 +655,11 @@ function App() {
       const normalized = normalizeScans(payload)
 
       if (!normalized.length) {
-        setLoadingScans(false)
+        setScans([])
+        setCurrentScanId('')
+        setStatusData(buildEmptyStatus())
+        setResultsData(buildEmptyResults())
+        setReportData(buildEmptyReport())
         pushToast('Live API connected', 'No scans were returned yet, keeping the shell empty.')
         setDataSource('live')
         return
@@ -728,6 +820,11 @@ function App() {
   )
 
   useEffect(() => {
+    if (hasLoadedScansRef.current) {
+      return
+    }
+
+    hasLoadedScansRef.current = true
     loadScans()
   }, [loadScans])
 
@@ -832,7 +929,7 @@ function App() {
       return
     }
 
-    if (!selectedChecks.length) {
+    if (!selectedCheckIds.length) {
       pushToast('Select at least one check', 'Enable at least one vulnerability module.')
       return
     }
@@ -848,8 +945,8 @@ function App() {
     try {
       const payload = await createScan({
         targetUrl: formState.targetUrl,
-        scanType: formState.scanType,
-        checks: selectedChecks,
+        scanType: scanTypeApiMap[formState.scanType] ?? 'FULL',
+        checks: selectedCheckIds.map((checkId) => checkTypeApiMap[checkId] ?? checkId),
       })
       const scanId = String(payload?.id ?? payload?.scanId ?? payload?.data?.id ?? '')
 
@@ -881,7 +978,9 @@ function App() {
       await loadStatus(scanId, true)
     } catch (error) {
       pushToast('Unable to start live scan', error.message)
-      startDemoScan(true)
+      if (error?.name === 'TypeError' || error?.status >= 500) {
+        startDemoScan(true)
+      }
     } finally {
       setSubmitting(false)
     }
@@ -1179,23 +1278,32 @@ function App() {
                           </tr>
                         </thead>
                         <tbody className="divide-y divide-white/8 bg-white/[0.03]">
-                          {scans.map((scan) => (
-                            <tr key={scan.id}>
-                              <td className="px-4 py-4">
-                                <p className="font-medium text-white">{scan.targetUrl}</p>
-                                <p className="mt-1 text-sm text-slate-400">{formatDateLabel(scan.createdAt)}</p>
-                              </td>
-                              <td className="px-4 py-4 text-sm text-slate-200">{scan.scanType}</td>
-                              <td className="px-4 py-4">
-                                <span className="rounded-full border border-white/10 px-3 py-1 text-xs text-slate-200">
-                                  {prettifyStatus(scan.status)}
-                                </span>
-                              </td>
-                              <td className="px-4 py-4 text-sm text-slate-200">
-                                {scan.riskScore ? `${scan.riskScore}/100` : 'Pending'}
+                          {scans.length ? (
+                            scans.map((scan) => (
+                              <tr key={scan.id}>
+                                <td className="px-4 py-4">
+                                  <p className="font-medium text-white">{scan.targetUrl}</p>
+                                  <p className="mt-1 text-sm text-slate-400">{formatDateLabel(scan.createdAt)}</p>
+                                </td>
+                                <td className="px-4 py-4 text-sm text-slate-200">{scan.scanType}</td>
+                                <td className="px-4 py-4">
+                                  <span className="rounded-full border border-white/10 px-3 py-1 text-xs text-slate-200">
+                                    {prettifyStatus(scan.status)}
+                                  </span>
+                                </td>
+                                <td className="px-4 py-4 text-sm text-slate-200">
+                                  {scan.riskScore ? `${scan.riskScore}/100` : 'Pending'}
+                                </td>
+                              </tr>
+                            ))
+                          ) : (
+                            <tr>
+                              <td colSpan="4" className="px-4 py-8 text-center text-sm text-slate-400">
+                                Live API is connected, but there are no scans yet. Start the first scan
+                                from the Scan page.
                               </td>
                             </tr>
-                          ))}
+                          )}
                         </tbody>
                       </table>
                     </div>
@@ -1385,7 +1493,7 @@ function App() {
                     <div>
                       <p className="text-sm font-medium text-slate-400">Current scan</p>
                       <h3 className="mt-2 text-2xl font-semibold text-white">
-                        {currentScan?.targetUrl ?? 'No active scan'}
+                        {currentScan?.targetUrl ?? 'No active scan yet'}
                       </h3>
                       <p className="mt-2 text-sm leading-7 text-slate-300">
                         {statusData.currentStage} • {prettifyStatus(statusData.state)}
@@ -1464,11 +1572,11 @@ function App() {
                   <div className="mt-6 grid gap-4 md:grid-cols-3">
                     <div className="rounded-[1.5rem] border border-white/10 bg-white/[0.03] p-4">
                       <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Scan ID</p>
-                      <p className="mt-2 text-sm font-semibold text-white">{currentScanId}</p>
+                      <p className="mt-2 text-sm font-semibold text-white">{currentScanId || '—'}</p>
                     </div>
                     <div className="rounded-[1.5rem] border border-white/10 bg-white/[0.03] p-4">
                       <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Type</p>
-                      <p className="mt-2 text-sm font-semibold text-white">{currentScan?.scanType}</p>
+                      <p className="mt-2 text-sm font-semibold text-white">{currentScan?.scanType ?? '—'}</p>
                     </div>
                     <div className="rounded-[1.5rem] border border-white/10 bg-white/[0.03] p-4">
                       <p className="text-xs uppercase tracking-[0.22em] text-slate-500">Source</p>
